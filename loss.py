@@ -15,14 +15,15 @@ def disparity_to_depth(disparity, min_depth=0.1, max_depth=100, stereo_scale_fac
     return depth
 
 class StereoDepthLoss(object):
-    def __init__(self, K, b, height, width, batch_size, alpha=0.85, lambda_ = 0.01):
+    def __init__(self, K, b, height, width, batch_size, device, alpha=0.85, lambda_ = 0.01):
         self.T_rl = np.identity(4)
         self.T_rl[0, 3] = -b
-        self.T_lr = -self.T_rl.copy()
-        self.T_lr = torch.from_numpy(self.T_lr).repeat(batch_size, 1, 1)
-        self.T_rl = torch.from_numpy(self.T_rl).repeat(batch_size, 1, 1)
+        self.T_lr = np.identity(4)
+        self.T_lr[0, 3] = b
+        self.T_lr = torch.from_numpy(self.T_lr).repeat(batch_size, 1, 1).to(device)
+        self.T_rl = torch.from_numpy(self.T_rl).repeat(batch_size, 1, 1).to(device)
 
-        self.K = torch.from_numpy(K).repeat(batch_size, 1, 1)
+        self.K = torch.from_numpy(K).repeat(batch_size, 1, 1).to(device)
         self.height = height
         self.width = width
         self.alpha = alpha
@@ -44,13 +45,14 @@ class StereoDepthLoss(object):
         image_l, image_r = inputs
         disparity_l, disparity_r = outputs
         
-        image_r_predicted = self.get_predicted_right(image_l, disparity_l)
-        image_l_predicted = self.get_predicted_left(image_r, disparity_r)
+        image_r_predicted = self.get_predicted_right(image_l.double(), disparity_l)
+        image_l_predicted = self.get_predicted_left(image_r.double(), disparity_r)
 
         return (image_l_predicted, image_r_predicted)
 
     def calculate_loss(self, inputs, outputs, predicted):
         image_l, image_r = inputs
+        image_l, image_r = image_l.float(), image_r.float()
         image_l_predicted, image_r_predicted = predicted
         disparity_l, disparity_r = outputs
                 
@@ -63,8 +65,8 @@ class StereoDepthLoss(object):
         reprojection_loss += (1 - self.alpha)*torch.mean(torch.abs(image_r - image_r_predicted))
         
         # Inverse Depth Smoothness Loss
-        smoothness_loss = kornia.losses.inverse_depth_smoothness_loss(disparity_l, image_l.float())
-        smoothness_loss += kornia.losses.inverse_depth_smoothness_loss(disparity_r, image_r.float())
+        smoothness_loss = kornia.losses.inverse_depth_smoothness_loss(disparity_l, image_l)
+        smoothness_loss += kornia.losses.inverse_depth_smoothness_loss(disparity_r, image_r)
 
         losses = {}
         losses["smoothness"] = smoothness_loss
