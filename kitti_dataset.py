@@ -7,6 +7,8 @@ from torch.utils.data import Dataset
 from torchvision.io import read_image
 import random
 
+import os
+
 from PIL import Image
 import numpy as np
 
@@ -69,6 +71,8 @@ class KittiStereoDataset(Dataset):
                            [  0.    , 718.856 , 185.2157],
                            [  0.    ,   0.    ,   1.    ]])
         self.b = 0.5372
+
+        self.full_res_shape = (1242, 375)
         
 
     def __len__(self):
@@ -82,5 +86,31 @@ class KittiStereoDataset(Dataset):
         
         return self.transform((image_l, image_r))        
 
+    def check_depth(self):
+        line = self.filenames[0].split()
+        scene_name = line[0]
+        frame_index = int(line[1])
 
+        velo_filename = os.path.join(
+            self.data_path,
+            scene_name,
+            "velodyne_points/data/{:010d}.bin".format(int(frame_index)))
 
+        return os.path.isfile(velo_filename)
+    
+    def get_depth(self, folder, frame_index, side, do_flip):
+        calib_path = os.path.join(self.dataset_path, folder.split("/")[0])
+
+        velo_filename = os.path.join(
+            self.dataset_path,
+            folder,
+            "velodyne_points/data/{:010d}.bin".format(int(frame_index)))
+
+        depth_gt = generate_depth_map(calib_path, velo_filename, self.side_map[side])
+        depth_gt = skimage.transform.resize(
+            depth_gt, self.full_res_shape[::-1], order=0, preserve_range=True, mode='constant')
+
+        if do_flip:
+            depth_gt = np.fliplr(depth_gt)
+
+        return depth_gt
