@@ -68,10 +68,7 @@ class StereoDepthLoss(object):
         smoothness_loss = kornia.losses.inverse_depth_smoothness_loss(disparity_l, image_l)
         smoothness_loss += kornia.losses.inverse_depth_smoothness_loss(disparity_r, image_r)
 
-        losses = {}
-        losses["smoothness"] = smoothness_loss
-        losses["reprojection"] = reprojection_loss
-        losses["total_loss"] = reprojection_loss + self.lambda_*smoothness_loss
-        
-        return losses
+        loss = reprojection_loss + self.lambda_*smoothness_loss
+
+        return loss
         

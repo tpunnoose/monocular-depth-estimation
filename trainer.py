@@ -1,6 +1,7 @@
 # adapted from https://github.com/nianticlabs/monodepth2/blob/master/trainer.py
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 import numpy as np
@@ -96,26 +97,26 @@ class Trainer:
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
 
-    # def val(self):
-    #     """Validate the model on a single minibatch
-    #     """
-    #     self.set_eval()
-    #     try:
-    #         inputs = self.val_iter.next()
-    #     except StopIteration:
-    #         self.val_iter = iter(self.val_loader)
-    #         inputs = self.val_iter.next()
+    def val(self):
+        """Validate the model on a single minibatch
+        """
+        self.set_eval()
+        try:
+            inputs = self.val_iter.next()
+        except StopIteration:
+            self.val_iter = iter(self.val_loader)
+            inputs = self.val_iter.next()
 
-    #     with torch.no_grad():
-    #         outputs, losses = self.process_batch(inputs)
+        with torch.no_grad():
+            outputs, losses = self.process_batch(inputs)
 
-    #         if "depth_gt" in inputs:
-    #             self.compute_depth_losses(inputs, outputs, losses)
+            if "depth_gt_l" in inputs:
+                self.compute_depth_losses(inputs, outputs, losses)
 
-    #         self.log("val", inputs, outputs, losses)
-    #         del inputs, outputs, losses
+            self.log("val", inputs, outputs, losses)
+            del inputs, outputs, losses
 
-    #     self.set_train()
+        self.set_train()
 
     def run_epoch(self):
         if self.epoch > 0:
@@ -127,7 +128,7 @@ class Trainer:
         for batch_idx, inputs in enumerate(self.train_loader):
             before_op_time = time.time()
 
-            losses, outputs, predicted = self.process_batch(inputs)
+            losses, outputs = self.process_batch(inputs)
 
             self.optimizer.zero_grad()
             losses["total_loss"].backward()
@@ -145,30 +146,95 @@ class Trainer:
                 if "depth_gt" in inputs:
                     self.compute_depth_losses(inputs, outputs, losses)
 
-                self.log("train", inputs, outputs, predicted, losses)
+                self.log("train", inputs, outputs, losses)
                 # self.val()
 
             self.step += 1
 
     def process_batch(self, inputs):
-        inputs[0] = inputs[0].to(self.device)
-        inputs[1] = inputs[1].to(self.device)
-        image_l, image_r = inputs
+        for key, ipt in inputs.items():
+            inputs[key] = ipt.to(self.device)
+        
+        augmented_inputs = (inputs["l_color_aug"], inputs["r_color_aug"])
+        inputs = (inputs["l"], inputs["r"])
 
-        features_l = self.encoder(image_l)
-        disparities_l = self.decoder(features_l)
-        disparity_l_full_size = disparities_l[("disp", 0)]
+        features_l = self.encoder(inputs["l_color_aug"])
+        outputs_l = self.decoder(features_l)
 
-        features_r = self.encoder(image_r)
-        disparities_r = self.decoder(features_r)
-        disparity_r_full_size = disparities_r[("disp", 0)]
+        features_r = self.encoder(inputs["r_color_aug"])
+        outputs_r = self.decoder(features_r)
 
-        outputs = (disparity_l_full_size, disparity_r_full_size)
+        losses = {}
+        total_loss = 0.
 
-        predicted = self.stereo_loss.generate_predicted_images(inputs, outputs)
-        losses = self.stereo_loss.calculate_loss(inputs, outputs, predicted)
+        for s in self.opt.scales:
+            disparity_l_s = outputs_l[("disp", s)]
+            disparity_r_s = outputs_r[("disp", s)]
 
-        return losses, outputs, predicted
+            if s != 0:
+                disparity_l_s = F.interpolate(
+                    disparity_l_s, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
+                disparity_r_s = F.interpolate(
+                    disparity_r_s, [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
+
+                outputs_l[("disp_intp", s)] = disparity_l_s
+                outputs_r[("disp_intp", s)] = disparity_r_s
+
+            out_s = (disparity_l_s, disparity_r_s)
+
+            predicted = self.stereo_loss.generate_predicted_images(augmented_inputs, out_s)
+
+            outputs_l[("predicted", s)] = predicted[0]
+            outputs_r[("predicted", s)] = predicted[1]
+
+            losses["{}".format(s)] = self.stereo_loss.calculate_loss(inputs, out_s, predicted)
+            total_loss += losses["{}".format(s)]
+        
+        outputs_l["depth"] = disparity_to_depth(outputs_l[("disp", 0)])
+        outputs_r["depth"] = disparity_to_depth(outputs_r[("disp", 0)])
+
+        losses["total_loss"] = total_loss/len(self.opt.scales)
+        outputs = (outputs_l, outputs_r)
+
+        return losses, outputs
+
+    def compute_depth_losses(self, inputs, outputs, losses):
+        """Compute depth metrics, to allow monitoring during training
+        This isn't particularly accurate as it averages over the entire batch,
+        so is only used to give an indication of validation performance
+        """
+        outputs_l, outputs_r = outputs
+
+        depth_pred_l = outputs_l["depth"]
+        depth_pred_r = outputs_r["depth"]
+
+        for metric in self.depth_metric_names:
+            losses[metric] = 0.
+
+        for i, depth_pred in enumerate([depth_pred_l, depth_pred_r]):
+            depth_pred = torch.clamp(F.interpolate(
+                depth_pred, [375, 1242], mode="bilinear", align_corners=False), 1e-3, 80)
+            depth_pred = depth_pred.detach()
+
+            s = "l" if i == 0 else "r"
+            depth_gt = inputs["depth_gt_" + s]
+            mask = depth_gt > 0
+
+            # garg/eigen crop
+            crop_mask = torch.zeros_like(mask)
+            crop_mask[:, :, 153:371, 44:1197] = 1
+            mask = mask * crop_mask
+
+            depth_gt = depth_gt[mask]
+            depth_pred = depth_pred[mask]
+            depth_pred *= torch.median(depth_gt) / torch.median(depth_pred)
+
+            depth_pred = torch.clamp(depth_pred, min=1e-3, max=80)
+
+            depth_errors = compute_depth_errors(depth_gt, depth_pred)
+
+            for i, metric in enumerate(self.depth_metric_names):
+                losses[metric] += np.array(depth_errors[i].cpu())/2
 
     def log_time(self, batch_idx, duration, loss):
         """Print a logging statement to the terminal
@@ -182,16 +248,15 @@ class Trainer:
         print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
         
-    def log(self, mode, inputs, outputs, predicted, losses):
+    def log(self, mode, inputs, outputs, losses):
         """Write an event to the tensorboard events file
         """
         writer = self.writers[mode]
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
 
-        image_l, image_r = inputs
-        predicted_l, predicted_r = predicted
-        disp_l, disp_r = outputs
+        image_l, image_r = inputs["l"], inputs["r"]
+        outputs_l, outputs_r = outputs
 
         for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
             writer.add_image(
@@ -200,18 +265,19 @@ class Trainer:
             writer.add_image(
                 "right/{}".format(j),
                 image_r[j].data, self.step)
-            writer.add_image(
-                "left_pred/{}".format(j),
-                normalize_image(predicted_l[j].data), self.step)
-            writer.add_image(
-                "right_pred/{}".format(j),
-                normalize_image(predicted_r[j].data), self.step)
-            writer.add_image(
-                "disp_left/{}".format(j),
-                normalize_image(disp_l[j]), self.step)
-            writer.add_image(
-                "disp_right/{}".format(j),
-                normalize_image(disp_r[j]), self.step)
+            for s in self.opt.scales:
+                writer.add_image(
+                    "left_pred_{}/{}".format(s, j),
+                    normalize_image(outputs_l[("predicted", s)][j].data), self.step)
+                writer.add_image(
+                    "right_pred_{}/{}".format(s, j),
+                    normalize_image(outputs_r[("predicted", s)][j].data), self.step)
+                writer.add_image(
+                    "disp_left_{}/{}".format(s, j),
+                    normalize_image(outputs_l[("disp", s)][j]), self.step)
+                writer.add_image(
+                    "disp_right_{}/{}".format(s, j),
+                    normalize_image(outputs_r[("disp", s)][j]), self.step)
     
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with

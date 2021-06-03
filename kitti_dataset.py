@@ -9,22 +9,11 @@ import random
 
 import os
 
-from PIL import Image
 import numpy as np
+from kitti_utils import *
 
-class JointRandomFlip(object):
-    def __init__(self, p=0.5):
-        self.p = p
-        
-    def __call__(self, image_pair):
-        image_l, image_r = image_pair
-        
-        # ensure horizontal flips are geometrically consistent
-        if random.random() > self.p:
-            return (tvF.hflip(image_r), tvF.hflip(image_l))
-        else:
-            return (image_l, image_r)
-        
+import skimage
+
 class JointColorAugmentation(object):
     def __init__(self, brightness, contrast, saturation, hue, p=0.5):
         self.color_jitter = transforms.ColorJitter(brightness, contrast, saturation, hue)
@@ -63,9 +52,7 @@ class KittiStereoDataset(Dataset):
         hue = (-0.1, 0.1)
         
         self.resizer = transforms.Resize((height, width))
-        color_jitter = JointColorAugmentation(brightness, contrast, saturation, hue)
-        horizontal_flip = JointRandomFlip()
-        self.transform = transforms.Compose([color_jitter, horizontal_flip])
+        self.color_jitter = JointColorAugmentation(brightness, contrast, saturation, hue)
         
         self.K = np.array([[718.856 ,   0.    , 607.1928],
                            [  0.    , 718.856 , 185.2157],
@@ -73,18 +60,53 @@ class KittiStereoDataset(Dataset):
         self.b = 0.5372
 
         self.full_res_shape = (1242, 375)
+
+        self.load_depth = self.check_depth()
         
 
     def __len__(self):
         return len(self.filenames)
 
     def __getitem__(self, index):
+        inputs = {}
+
         split_names = self.filenames[index].split()
         
         image_l = self.resizer(read_image(self.dataset_path + split_names[0]))
         image_r = self.resizer(read_image(self.dataset_path + split_names[1]))
-        
-        return self.transform((image_l, image_r))        
+
+        do_flip = random.random() > self.p
+        color_aug = random.random() > self.p
+
+        if do_flip:
+            image_l, image_r = tvF.hflip(image_r), tvF.hflip(image_l)
+
+        inputs["l"] = image_l
+        inputs["r"] = image_r
+
+        if color_aug:
+            image_l, image_r = self.color_jitter((image_l, image_r))
+
+        inputs["l_color_aug"] = image_l
+        inputs["r_color_aug"] = image_r
+
+        if self.load_depth:
+            folder = split_names[0]
+            depth_gt_a = self.get_depth(folder, 0, 2, do_flip)
+            depth_gt_b = self.get_depth(folder, 0, 3, do_flip)
+            if do_flip:
+                s_a = "r"
+                s_b = "l"
+            else:
+                s_a = "l"
+                s_b = "r"
+            inputs["depth_gt_" + s_a] = np.expand_dims(depth_gt_a, 0)
+            inputs["depth_gt_" + s_b] = np.expand_dims(depth_gt_b, 0)
+            
+            inputs["depth_gt_l"] = torch.from_numpy(inputs["depth_gt_l"].astype(np.float32))
+            inputs["depth_gt_r"] = torch.from_numpy(inputs["depth_gt_r"].astype(np.float32))
+
+        return inputs
 
     def check_depth(self):
         line = self.filenames[0].split()
